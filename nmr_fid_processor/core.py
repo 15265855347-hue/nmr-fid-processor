@@ -22,6 +22,8 @@ class NMRProcessingConfig:
     spectral_width_ppm: float = 20.0
     baseline_lambda: float = 1e5
     baseline_order: int = 2
+    zero_fill_factor: int = 2
+    baseline_method: str = "asls"
 
 
 def read_fid(path: str | Path) -> np.ndarray:
@@ -61,6 +63,17 @@ def _apply_exponential_window(fid: np.ndarray, lb: float, dwell_time_s: float) -
     time_axis = np.arange(n_points, dtype=np.float64) * dwell_time_s
     window = np.exp(-lb * np.pi * time_axis)
     return fid * window
+
+
+def _zero_padding(fid: np.ndarray, factor: int = 2) -> np.ndarray:
+    """Pad the FID with zeros by the requested factor before Fourier transform."""
+    if factor <= 1:
+        return np.asarray(fid, dtype=np.float64).copy()
+
+    data = np.asarray(fid, dtype=np.float64)
+    padded = np.zeros(int(data.size * factor), dtype=np.float64)
+    padded[: data.size] = data
+    return padded
 
 
 def _fft_spectrum(fid: np.ndarray) -> np.ndarray:
@@ -117,9 +130,41 @@ def _whittaker_smoother(signal: np.ndarray, lam: float, order: int = 2) -> np.nd
     return np.asarray(baseline, dtype=np.float64)
 
 
+def _asls_baseline(signal: np.ndarray, lam: float = 1e5, p: float = 0.01, max_iter: int = 10) -> np.ndarray:
+    """Asymmetric least squares (AsLS) baseline estimation."""
+    signal = np.asarray(signal, dtype=np.float64)
+    if signal.ndim != 1:
+        raise ValueError("The signal must be one-dimensional.")
+    if signal.size == 0:
+        return signal.copy()
+    if lam <= 0:
+        return np.zeros_like(signal, dtype=np.float64)
+    if not 0.0 < p < 1.0:
+        p = 0.01
+
+    n = signal.size
+    d = _difference_matrix(n, 2)
+    weights = np.ones(n, dtype=np.float64)
+    baseline = signal.copy()
+
+    for _ in range(max_iter):
+        w = diags(weights, 0, shape=(n, n), format="csr")
+        system = w + lam * (d.T @ d)
+        baseline = spsolve(system.tocsr(), weights * signal)
+        weights = np.where(signal > baseline, p, 1.0 - p)
+
+    return np.asarray(baseline, dtype=np.float64)
+
+
 def _whittaker_baseline_correct(real_spectrum: np.ndarray, lam: float, order: int = 2) -> np.ndarray:
     """Subtract the smooth baseline estimated by the Whittaker smoother."""
     baseline = _whittaker_smoother(real_spectrum, lam=lam, order=order)
+    return real_spectrum - baseline
+
+
+def _asls_baseline_correct(real_spectrum: np.ndarray, lam: float, p: float = 0.01, max_iter: int = 10) -> np.ndarray:
+    """Subtract the AsLS-estimated baseline from the real spectrum."""
+    baseline = _asls_baseline(real_spectrum, lam=lam, p=p, max_iter=max_iter)
     return real_spectrum - baseline
 
 
@@ -136,6 +181,28 @@ def _auto_reference(ppm_axis: np.ndarray, spectrum: np.ndarray, reference_ppm: f
     return ppm_axis - shift
 
 
+def _icoshift_align(spectrum: np.ndarray, ppm_axis: np.ndarray, reference_ppm: float) -> tuple[np.ndarray, np.ndarray, int]:
+    """Align a 1D spectrum to a reference ppm by shifting the dominant peak to the target position.
+
+    This follows the same spirit as icoshift alignment: a peak-centric shift in the spectral
+    dimension, but implemented as a fast 1D integer shift to keep the pipeline robust and dependency
+    free.
+    """
+    spectrum = np.asarray(spectrum, dtype=np.float64)
+    ppm_axis = np.asarray(ppm_axis, dtype=np.float64)
+    if spectrum.size != ppm_axis.size:
+        raise ValueError("Spectrum and ppm axis must be the same length.")
+    if spectrum.size == 0:
+        return spectrum.copy(), ppm_axis.copy(), 0
+
+    peak_index = int(np.argmax(np.abs(spectrum)))
+    target_index = int(np.argmin(np.abs(ppm_axis - reference_ppm)))
+    shift_index = target_index - peak_index
+    aligned = np.roll(spectrum, -shift_index)
+    aligned_ppm = ppm_axis - (ppm_axis[peak_index] - reference_ppm)
+    return aligned, aligned_ppm, shift_index
+
+
 def process_fid(
     fid: np.ndarray,
     lb: float = 0.3,
@@ -146,28 +213,51 @@ def process_fid(
     spectral_width_ppm: float = 20.0,
     baseline_lambda: float = 1e5,
     baseline_order: int = 2,
+    zero_fill_factor: int = 2,
+    baseline_method: str = "asls",
+    asls_p: float = 0.01,
+    asls_max_iter: int = 10,
 ) -> dict[str, Any]:
-    """Process a raw 1D FID into a phased, baseline-corrected, ppm-referenced spectrum."""
+    """Process a raw 1D FID into a phased, baseline-corrected, ppm-referenced spectrum.
+
+    Pipeline:
+      1. FID load
+      2. Exponential apodization (LB)
+      3. Zero-fill before FFT
+      4. FFT transform
+      5. Phase correction
+      6. Baseline correction (AsLS by default, with Whittaker supported)
+      7. Chemical-shift alignment to reference ppm via a peak-centric icoshift-style shift
+    """
 
     input_fid = np.asarray(fid, dtype=np.float64)
     if input_fid.ndim != 1:
         raise ValueError("The input FID must be a 1D NumPy array.")
 
-    apodized = _apply_exponential_window(input_fid, lb=lb, dwell_time_s=dwell_time_s)
+    zero_filled = _zero_padding(input_fid, factor=zero_fill_factor)
+    apodized = _apply_exponential_window(zero_filled, lb=lb, dwell_time_s=dwell_time_s)
     spectrum = _fft_spectrum(apodized)
     phased = _phase_correct(spectrum, ph0=ph0, ph1=ph1)
 
     real_part = np.real(phased)
-    corrected = _whittaker_baseline_correct(real_part, lam=baseline_lambda, order=baseline_order)
+    method = (baseline_method or "asls").lower()
+    if method == "asls":
+        corrected = _asls_baseline_correct(real_part, lam=baseline_lambda, p=asls_p, max_iter=asls_max_iter)
+    elif method == "whittaker":
+        corrected = _whittaker_baseline_correct(real_part, lam=baseline_lambda, order=baseline_order)
+    else:
+        raise ValueError(f"Unsupported baseline method: {baseline_method!r}. Use 'asls' or 'whittaker'.")
+
     ppm_axis = _ppm_axis(corrected.size, spectral_width_ppm)
-    corrected_ppm = _auto_reference(ppm_axis, corrected, reference_ppm)
+    aligned_spectrum, aligned_ppm, shift_index = _icoshift_align(corrected, ppm_axis, reference_ppm)
 
     return {
         "fid": input_fid,
         "apodized_fid": apodized,
-        "spectrum": corrected,
-        "ppm": corrected_ppm,
+        "spectrum": aligned_spectrum,
+        "ppm": aligned_ppm,
         "reference_ppm": reference_ppm,
+        "alignment_shift_points": shift_index,
         "config": {
             "lb": lb,
             "ph0": ph0,
@@ -176,6 +266,10 @@ def process_fid(
             "spectral_width_ppm": spectral_width_ppm,
             "baseline_lambda": baseline_lambda,
             "baseline_order": baseline_order,
+            "zero_fill_factor": zero_fill_factor,
+            "baseline_method": method,
+            "asls_p": asls_p,
+            "asls_max_iter": asls_max_iter,
         },
     }
 
@@ -208,13 +302,26 @@ def main() -> None:
         "--baseline-lambda",
         type=float,
         default=1e5,
-        help="Smoothness parameter for Whittaker smoother (default: 1e5).",
+        help="Smoothness parameter for baseline correction (default: 1e5).",
     )
     parser.add_argument(
         "--baseline-order",
         type=int,
         default=2,
-        help="Difference order for baseline smoothing (default: 2 = curvature penalty).",
+        help="Difference order for Whittaker smoothing (default: 2 = curvature penalty).",
+    )
+    parser.add_argument(
+        "--zero-fill-factor",
+        type=int,
+        default=2,
+        help="Zero-fill factor for the FID before FFT (default: 2).",
+    )
+    parser.add_argument(
+        "--baseline-method",
+        type=str,
+        default="asls",
+        choices=["asls", "whittaker"],
+        help="Baseline correction method.",
     )
     args = parser.parse_args()
 
@@ -229,6 +336,8 @@ def main() -> None:
         spectral_width_ppm=args.spectral_width_ppm,
         baseline_lambda=args.baseline_lambda,
         baseline_order=args.baseline_order,
+        zero_fill_factor=args.zero_fill_factor,
+        baseline_method=args.baseline_method,
     )
 
     export_csv(args.output, processed["ppm"], processed["spectrum"])
