@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 
 from nmr_fid_processor.core import export_csv, process_fid, read_fid
 
@@ -16,8 +15,18 @@ def main() -> None:
     parser.add_argument("--reference-ppm", type=float, default=1.25, help="Reference ppm position.")
     parser.add_argument("--dwell-time-s", type=float, default=1e-6, help="Dwell time in seconds.")
     parser.add_argument("--spectral-width-ppm", type=float, default=20.0, help="Spectral width in ppm.")
-    parser.add_argument("--baseline-window", type=int, default=101, help="Window length for baseline smoothing.")
-    parser.add_argument("--baseline-polyorder", type=int, default=3, help="Polynomial order for baseline smoothing.")
+    parser.add_argument(
+        "--baseline-lambda",
+        type=float,
+        default=1e5,
+        help="Smoothness parameter for Whittaker smoother.",
+    )
+    parser.add_argument(
+        "--baseline-order",
+        type=int,
+        default=2,
+        help="Difference order for Whittaker smoothing.",
+    )
     args = parser.parse_args()
 
     fid = read_fid(args.input)
@@ -29,8 +38,8 @@ def main() -> None:
         reference_ppm=args.reference_ppm,
         dwell_time_s=args.dwell_time_s,
         spectral_width_ppm=args.spectral_width_ppm,
-        baseline_window=args.baseline_window,
-        baseline_polyorder=args.baseline_polyorder,
+        baseline_lambda=args.baseline_lambda,
+        baseline_order=args.baseline_order,
     )
 
     export_csv(args.output, processed["ppm"], processed["spectrum"])

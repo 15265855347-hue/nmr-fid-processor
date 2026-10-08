@@ -6,7 +6,8 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from scipy.signal import savgol_filter
+from scipy.sparse import diags, eye
+from scipy.sparse.linalg import spsolve
 
 
 @dataclass
@@ -19,12 +20,12 @@ class NMRProcessingConfig:
     reference_ppm: float = 1.25
     dwell_time_s: float = 1e-6
     spectral_width_ppm: float = 20.0
-    baseline_window: int = 101
-    baseline_polyorder: int = 3
+    baseline_lambda: float = 1e5
+    baseline_order: int = 2
 
 
 def read_fid(path: str | Path) -> np.ndarray:
-    """Load a 1D FID array from a .npy or .csv file."""
+    """Load a 1D FID array from a .npy, .csv, or .txt file."""
 
     file_path = Path(path)
 
@@ -79,28 +80,52 @@ def _phase_correct(spectrum: np.ndarray, ph0: float, ph1: float) -> np.ndarray:
     return phase_corrected
 
 
-def _baseline_correct(real_spectrum: np.ndarray, window: int, polyorder: int) -> np.ndarray:
-    """Estimate and subtract a smooth baseline from the spectrum."""
-    if window <= 0 or real_spectrum.size < window:
-        return real_spectrum.copy()
+def _difference_matrix(n: int, order: int):
+    """Construct the sparse finite-difference matrix for a chosen order."""
+    if order <= 0 or n <= 0:
+        return eye(n, format="csr")
 
-    odd_window = max(window // 2 * 2 + 1, 5)
-    if odd_window > real_spectrum.size:
-        odd_window = max(real_spectrum.size if real_spectrum.size % 2 == 1 else real_spectrum.size - 1, 5)
+    d = eye(n, format="csr")
+    for _ in range(order):
+        rows = d.shape[0] - 1
+        if rows <= 0:
+            break
+        d = diags([np.ones(rows), -np.ones(rows)], [0, 1], shape=(rows, d.shape[1]), format="csr") @ d
+    return d
 
-    baseline = savgol_filter(
-        real_spectrum,
-        window_length=odd_window,
-        polyorder=min(polyorder, odd_window - 1),
-        mode="interp",
-    )
+
+def _whittaker_smoother(signal: np.ndarray, lam: float, order: int = 2) -> np.ndarray:
+    """Apply Whittaker smoother (penalized least squares) to estimate the baseline."""
+    signal = np.asarray(signal, dtype=np.float64)
+    if signal.ndim != 1:
+        raise ValueError("The signal must be one-dimensional.")
+
+    n = signal.size
+    if n == 0:
+        return signal.copy()
+
+    if lam <= 0:
+        return signal.copy()
+
+    if order < 1:
+        return signal.copy()
+
+    d = _difference_matrix(n, order)
+    smooth_matrix = eye(n, format="csr") + lam * (d.T @ d)
+    baseline = spsolve(smooth_matrix.tocsr(), signal)
+
+    return np.asarray(baseline, dtype=np.float64)
+
+
+def _whittaker_baseline_correct(real_spectrum: np.ndarray, lam: float, order: int = 2) -> np.ndarray:
+    """Subtract the smooth baseline estimated by the Whittaker smoother."""
+    baseline = _whittaker_smoother(real_spectrum, lam=lam, order=order)
     return real_spectrum - baseline
 
 
-def _ppm_axis(spectrum_size: int, spectral_width_ppm: float, reference_ppm: float) -> np.ndarray:
-    """Build a ppm axis and shift the highest-intensity peak to the reference ppm."""
-    ppm_axis = np.linspace(-spectral_width_ppm / 2.0, spectral_width_ppm / 2.0, spectrum_size)
-    return ppm_axis
+def _ppm_axis(spectrum_size: int, spectral_width_ppm: float) -> np.ndarray:
+    """Generate a ppm axis over the given spectral window."""
+    return np.linspace(-spectral_width_ppm / 2.0, spectral_width_ppm / 2.0, spectrum_size)
 
 
 def _auto_reference(ppm_axis: np.ndarray, spectrum: np.ndarray, reference_ppm: float) -> np.ndarray:
@@ -119,8 +144,8 @@ def process_fid(
     reference_ppm: float = 1.25,
     dwell_time_s: float = 1e-6,
     spectral_width_ppm: float = 20.0,
-    baseline_window: int = 101,
-    baseline_polyorder: int = 3,
+    baseline_lambda: float = 1e5,
+    baseline_order: int = 2,
 ) -> dict[str, Any]:
     """Process a raw 1D FID into a phased, baseline-corrected, ppm-referenced spectrum."""
 
@@ -133,8 +158,8 @@ def process_fid(
     phased = _phase_correct(spectrum, ph0=ph0, ph1=ph1)
 
     real_part = np.real(phased)
-    corrected = _baseline_correct(real_part, window=baseline_window, polyorder=baseline_polyorder)
-    ppm_axis = _ppm_axis(corrected.size, spectral_width_ppm, reference_ppm)
+    corrected = _whittaker_baseline_correct(real_part, lam=baseline_lambda, order=baseline_order)
+    ppm_axis = _ppm_axis(corrected.size, spectral_width_ppm)
     corrected_ppm = _auto_reference(ppm_axis, corrected, reference_ppm)
 
     return {
@@ -149,8 +174,8 @@ def process_fid(
             "ph1": ph1,
             "dwell_time_s": dwell_time_s,
             "spectral_width_ppm": spectral_width_ppm,
-            "baseline_window": baseline_window,
-            "baseline_polyorder": baseline_polyorder,
+            "baseline_lambda": baseline_lambda,
+            "baseline_order": baseline_order,
         },
     }
 
@@ -179,8 +204,18 @@ def main() -> None:
     parser.add_argument("--reference-ppm", type=float, default=1.25, help="Desired ppm of the reference peak.")
     parser.add_argument("--dwell-time-s", type=float, default=1e-6, help="Dwell time in seconds.")
     parser.add_argument("--spectral-width-ppm", type=float, default=20.0, help="Spectral width in ppm.")
-    parser.add_argument("--baseline-window", type=int, default=101, help="Savitzky-Golay baseline window length.")
-    parser.add_argument("--baseline-polyorder", type=int, default=3, help="Savitzky-Golay polynomial order.")
+    parser.add_argument(
+        "--baseline-lambda",
+        type=float,
+        default=1e5,
+        help="Smoothness parameter for Whittaker smoother (default: 1e5).",
+    )
+    parser.add_argument(
+        "--baseline-order",
+        type=int,
+        default=2,
+        help="Difference order for baseline smoothing (default: 2 = curvature penalty).",
+    )
     args = parser.parse_args()
 
     fid = read_fid(args.input)
@@ -192,8 +227,8 @@ def main() -> None:
         reference_ppm=args.reference_ppm,
         dwell_time_s=args.dwell_time_s,
         spectral_width_ppm=args.spectral_width_ppm,
-        baseline_window=args.baseline_window,
-        baseline_polyorder=args.baseline_polyorder,
+        baseline_lambda=args.baseline_lambda,
+        baseline_order=args.baseline_order,
     )
 
     export_csv(args.output, processed["ppm"], processed["spectrum"])
